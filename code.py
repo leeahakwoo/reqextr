@@ -13,7 +13,8 @@ import io
 # --- 로직 클래스 ---
 class StreamlitDocxExtractor:
     """
-    [최종 완성본] 들여쓰기 수준(Indentation)을 분석하여 가장 정확한 계층 구조를 파악하는 클래스.
+    [최종 완성본] 사용자가 지정한 블릿 문자와 들여쓰기 수준을 모두 활용하여
+    가장 유연하고 정확하게 계층 구조를 분석하는 클래스.
     """
     def __init__(self, business_code: str = "MFDS"):
         self.business_code = business_code
@@ -40,46 +41,75 @@ class StreamlitDocxExtractor:
 
     def _get_indentation_level(self, p: Paragraph) -> int:
         """문단의 들여쓰기 수준을 반환합니다. (None일 경우 0으로 처리)"""
-        return p.paragraph_format.left_indent.pt if p.paragraph_format.left_indent else 0
+        # left_indent가 None일 수 있으므로 안전하게 확인
+        indent = p.paragraph_format.left_indent
+        return indent.pt if indent else 0
 
-    def _parse_details_from_paragraphs(self, paragraphs: List[Paragraph], req_id: str) -> List[Dict]:
+    def _parse_details_from_paragraphs(self, paragraphs: List[Paragraph], req_id: str, level1_bullets: str, level2_bullets: str) -> List[Dict]:
         """
-        [최종 로직] 들여쓰기 수준을 기반으로 계층 구조를 파악하여 요구사항을 추출합니다.
+        [최종 로직] 사용자 지정 블릿과 들여쓰기 수준을 모두 사용하여 계층을 분석합니다.
         """
         final_requirements = []
         bfn_seq_counter = 1
-        group_stack = []  # 그룹 제목을 저장하는 스택
+        group_stack = []  # ({'title': str, 'level': int})
+
+        l1_pattern = re.compile(f'^[{re.escape(level1_bullets)}]')
+        l2_pattern = re.compile(f'^[{re.escape(level2_bullets)}]')
 
         for p in paragraphs:
             line = p.text.strip()
             if not line:
                 continue
-
-            # 블릿 스타일이 적용된 문단만 처리
-            if not (p.style and 'List' in p.style.name):
+            
+            # 현재 문단의 블릿 종류와 들여쓰기 수준 확인
+            is_level1 = bool(l1_pattern.search(line))
+            is_level2 = bool(l2_pattern.search(line))
+            current_level = self._get_indentation_level(p)
+            
+            # 블릿이 아니면 다음 문단으로
+            if not is_level1 and not is_level2:
                 continue
-            
-            level = self._get_indentation_level(p)
-            
-            # 스택의 마지막 레벨보다 현재 레벨이 더 깊으면, 스택은 유지
-            # 스택의 마지막 레벨과 현재 레벨이 같거나 더 얕으면, 상위 그룹으로 돌아감
-            while group_stack and level <= group_stack[-1]['level']:
+
+            # 상위 그룹으로 돌아가야 하는지 판단 (들여쓰기가 얕아지면)
+            while group_stack and current_level < group_stack[-1]['level']:
                 group_stack.pop()
 
-            # 현재 문단이 그룹 제목이 될 수 있음
-            group_stack.append({'title': line, 'level': level})
-
-            # 현재 스택의 최상위 그룹(1레벨)
-            top_group = group_stack[0]['title'] if group_stack else ""
+            # 현재 문단을 스택에 추가 (1차 또는 2차 블릿 모두 스택에 들어갈 수 있음)
+            clean_line = re.sub(f'^[{re.escape(level1_bullets + level2_bullets)}]+\s*', '', line)
             
-            # 현재 문단이 세부 요구사항 (스택에 2개 이상 쌓였거나, 1개만 있어도 그 자체가 요구사항)
+            # 1차 블릿이 나오면 새로운 최상위 그룹이 될 수 있으므로 스택을 재구성
+            if is_level1:
+                # 현재 들여쓰기 수준보다 깊은 하위 그룹들은 모두 제거
+                while group_stack and current_level <= group_stack[-1]['level']:
+                    group_stack.pop()
+                group_stack.append({'title': clean_line, 'level': current_level})
+            
+            # 2차 블릿이면서, 상위 그룹이 존재할 때
+            elif is_level2 and group_stack:
+                 group_stack.append({'title': clean_line, 'level': current_level})
+
+
+            # 최종 요구사항으로 기록
             if group_stack:
-                 final_requirements.append({
-                    '요구사항 그룹': top_group,
-                    '세부 요구사항 내용': line,
-                    '세부 요구사항 ID': self._generate_id(req_id, bfn_seq_counter)
-                })
-                 bfn_seq_counter += 1
+                # 그룹명은 항상 스택의 첫 번째 요소
+                group_name = group_stack[0]['title']
+                # 세부 내용은 현재 문단의 내용
+                detail_content = clean_line
+                
+                # 중복 방지: 이미 추가된 내용인지 확인
+                is_duplicate = False
+                for req in final_requirements:
+                    if req['요구사항 그룹'] == group_name and req['세부 요구사항 내용'] == detail_content:
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    final_requirements.append({
+                        '요구사항 그룹': group_name,
+                        '세부 요구사항 내용': detail_content,
+                        '세부 요구사항 ID': self._generate_id(req_id, bfn_seq_counter)
+                    })
+                    bfn_seq_counter += 1
 
         return final_requirements
 
@@ -105,7 +135,6 @@ class StreamlitDocxExtractor:
             block_paragraphs = all_paragraphs[start_index:end_index]
             block_text = "\n".join([p.text for p in block_paragraphs])
             
-            # SyntaxWarning 해결: Raw string 사용
             req_id_match = re.search(r'요구사항 고유번호\s+([A-Z]{3}-\d{3})', block_text)
             req_name_match = re.search(r'요구사항 명칭\s+(.+?)(?:\n|$)', block_text)
 
@@ -121,8 +150,7 @@ class StreamlitDocxExtractor:
             
             if details_start_index_offset != -1:
                 details_paragraphs = block_paragraphs[details_start_index_offset:]
-                # 블릿 문자 설정은 더 이상 필요 없으므로 전달하지 않음
-                parsed_reqs = self._parse_details_from_paragraphs(details_paragraphs, req_id)
+                parsed_reqs = self._parse_details_from_paragraphs(details_paragraphs, req_id, level1_bullets, level2_bullets)
                 
                 for req in parsed_reqs:
                     req['요구사항 ID (RFP 원천)'] = req_id
@@ -130,7 +158,7 @@ class StreamlitDocxExtractor:
                 all_requirements.extend(parsed_reqs)
 
         if not all_requirements:
-            st.warning("요구사항 블록은 찾았으나, 세부 내용을 파싱하지 못했습니다. 문서의 '세부내용'에 글머리 기호 목록이 있는지 확인해주세요.")
+            st.warning("요구사항 블록은 찾았으나, 세부 내용을 파싱하지 못했습니다. 문서의 '세부내용'에 설정된 블릿 문자가 있는지 확인해주세요.")
             return pd.DataFrame()
 
         df = pd.DataFrame(all_requirements)
@@ -147,24 +175,26 @@ class StreamlitDocxExtractor:
 def main():
     st.set_page_config(page_title="요구사항 추출기", layout="wide", initial_sidebar_state="expanded")
     st.title("📄 DOCX 요구사항 정의서 자동 추출기")
-    st.markdown("MS Word의 **들여쓰기(Indentation)**를 분석하여, 글머리 기호 및 표(Table)에 포함된 요구사항 목록을 정확하게 생성합니다.")
+    st.markdown("사용자가 지정한 **블릿(Bullet) 문자**와 문서의 **들여쓰기(Indentation)**를 종합적으로 분석하여 요구사항 목록을 생성합니다.")
 
     with st.sidebar:
         st.header("⚙️ 분석 설정")
         business_code = st.text_input("사업 코드", value="MFDS", help="요구사항 ID 생성에 사용됩니다.")
-        st.info("이제 블릿 문자를 직접 입력할 필요 없이, 문서의 **글머리 기호 스타일**과 **들여쓰기**를 기반으로 자동으로 계층을 분석합니다.")
+        
+        st.markdown("---")
+        
+        st.subheader("블릿(Bullet) 체계 설정")
+        level1_bullets = st.text_input("1차 블릿 문자 (그룹)", value="*◦○•", help="요구사항 그룹을 나타내는 글머리 기호를 모두 입력하세요.")
+        level2_bullets = st.text_input("2차 블릿 문자 (세부 항목)", value="-·▴", help="세부 요구사항을 나타내는 글머리 기호를 모두 입력하세요.")
+        st.info("문서에 사용된 블릿을 정확히 입력해야 분석 성공률이 높아집니다.")
 
     uploaded_file = st.file_uploader("분석할 .docx 파일을 업로드하세요.", type=["docx"])
 
     if uploaded_file is not None:
         try:
-            # 블릿 설정은 더 이상 필요 없으므로 빈 문자열 전달
-            level1_bullets = ""
-            level2_bullets = ""
-            
             extractor = StreamlitDocxExtractor(business_code=business_code)
             
-            with st.spinner("파일 분석 및 요구사항 추출 중... (들여쓰기 분석 중)"):
+            with st.spinner("파일 분석 및 요구사항 추출 중..."):
                 requirements_df = extractor.process(uploaded_file, level1_bullets, level2_bullets)
 
             if not requirements_df.empty:
