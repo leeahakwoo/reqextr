@@ -12,8 +12,8 @@ import io
 # --- 로직 클래스 ---
 class StreamlitDocxExtractor:
     """
-    Streamlit 환경에 맞게 수정된 DOCX 요구사항 추출 클래스.
-    사용자가 블릿 체계를 직접 선택하여 분석할 수 있습니다.
+    [수정됨] 안정성을 높인 DOCX 요구사항 추출 클래스.
+    NoneType 오류를 방지하기 위해 텍스트 추출 로직을 강화했습니다.
     """
     def __init__(self, business_code: str = "MFDS"):
         self.business_code = business_code
@@ -26,30 +26,52 @@ class StreamlitDocxExtractor:
         return f"REQ-{self.business_code}-{req_type_code}-{id_num}{sequence:03d}"
 
     def get_all_text_from_doc(self, doc: Document) -> str:
-        """문서의 모든 요소를 재귀적으로 탐색하여 텍스트를 재구성합니다."""
+        """
+        [수정됨] 문서의 모든 요소를 재귀적으로 탐색하여 텍스트를 재구성합니다.
+        None 값을 빈 문자열로 처리하여 안정성을 확보합니다.
+        """
         full_text = []
+        # 문서의 모든 최상위 블록(문단, 표 등)을 순서대로 순회
         for block in doc.element.body:
-            if hasattr(block, 'text'): # Paragraph
-                full_text.append(block.text)
-            elif isinstance(block, docx.oxml.table.CT_Tbl): # Table
+            # 1. 블록이 문단(Paragraph)인 경우
+            if isinstance(block, docx.oxml.text.paragraph.CT_P):
+                para = docx.text.paragraph.Paragraph(block, doc)
+                # para.text가 None일 경우를 대비해 'or ""' 추가
+                full_text.append(para.text or "")
+            # 2. 블록이 표(Table)인 경우
+            elif isinstance(block, docx.oxml.table.CT_Tbl):
                 table = docx.table.Table(block, doc)
                 for row in table.rows:
+                    # 각 셀의 텍스트를 재귀적으로 추출 (이 함수는 이제 항상 문자열을 반환)
                     row_texts = [self.get_all_text_from_cell(cell) for cell in row.cells]
-                    full_text.append("\t".join(row_texts)) # 셀 간은 탭으로 구분
+                    full_text.append("\t".join(row_texts))
+        
+        # full_text 리스트에는 이제 None이 없으므로 안전하게 join 가능
         return "\n".join(full_text)
 
     def get_all_text_from_cell(self, cell: docx.table._Cell) -> str:
-        """표의 셀(cell) 안에 있는 모든 텍스트를 추출합니다 (중첩 표 포함)."""
-        cell_text = []
-        for block in cell._element.body:
-            if hasattr(block, 'text'):
-                cell_text.append(block.text)
+        """
+        [수정됨] 표의 셀(cell) 안에 있는 모든 텍스트를 추출합니다 (중첩 표 포함).
+        None 값을 빈 문자열로 처리하여 안정성을 확보합니다.
+        """
+        cell_text_list = []
+        # 셀 내부의 모든 블록(문단, 표 등)을 순회
+        for block in cell._element:
+            # 1. 블록이 문단(Paragraph)인 경우
+            if isinstance(block, docx.oxml.text.paragraph.CT_P):
+                # 문단의 부모 객체는 'cell'임
+                para = docx.text.paragraph.Paragraph(block, cell)
+                cell_text_list.append(para.text or "")
+            # 2. 블록이 중첩된 표(Table)인 경우
             elif isinstance(block, docx.oxml.table.CT_Tbl):
+                # 중첩된 표의 부모 객체는 'cell'임
                 inner_table = docx.table.Table(block, cell)
                 for row in inner_table.rows:
                     row_texts = [self.get_all_text_from_cell(inner_cell) for inner_cell in row.cells]
-                    cell_text.append("\t".join(row_texts))
-        return "\n".join(cell_text)
+                    cell_text_list.append("\t".join(row_texts))
+        
+        # 셀의 모든 내용을 하나의 문자열로 합쳐서 반환
+        return "\n".join(cell_text_list)
 
     def _parse_block_content(self, req_id: str, req_name: str, content: str, level1_bullets: str, level2_bullets: str) -> List[Dict]:
         """
@@ -61,6 +83,7 @@ class StreamlitDocxExtractor:
         l1_escaped = re.escape(level1_bullets)
         l2_escaped = re.escape(level2_bullets)
         
+        # 1차 블릿을 기준으로 그룹 분할
         sfr_groups_text = re.split(f'\n\s*(?=[{l1_escaped}])', content)
 
         for group_text in sfr_groups_text:
@@ -70,20 +93,22 @@ class StreamlitDocxExtractor:
             lines = [line.strip() for line in group_text.split('\n') if line.strip()]
             if not lines: continue
 
+            # 그룹 제목에서 블릿 제거
             group_title = re.sub(f'^[{l1_escaped}]+\s*', '', lines[0])
 
+            # 2차 블릿(세부 항목) 추출
             detailed_points = []
             for line in lines:
                 if re.match(f'^\s*[{l2_escaped}]', line):
                     detailed_points.append(re.sub(f'^\s*[{l2_escaped}]+\s*', '', line))
 
-            if not detailed_points:
+            if not detailed_points: # 2차 블릿이 없으면 1차 블릿 자체가 요구사항
                 final_requirements.append({
                     '요구사항 그룹': group_title, '세부 요구사항 내용': group_title,
                     '세부 요구사항 ID': self._generate_id(req_id, bfn_seq_counter)
                 })
                 bfn_seq_counter += 1
-            else:
+            else: # 2차 블릿이 있으면 각각을 세부 요구사항으로 추가
                 for point in detailed_points:
                     final_requirements.append({
                         '요구사항 그룹': group_title, '세부 요구사항 내용': point,
@@ -139,7 +164,8 @@ class StreamlitDocxExtractor:
             '세부 요구사항 ID', '요구사항 그룹', '세부 요구사항 내용', 
             '요구사항 ID (RFP 원천)', '요구사항 명칭 (RFP 원천)', '유형', '출처'
         ]
-        return df[column_order]
+        # 없는 컬럼이 있을 수 있으므로 reindex 사용
+        return df.reindex(columns=column_order)
 
 # --- Streamlit UI 구성 ---
 def main():
@@ -173,8 +199,9 @@ def main():
                 st.dataframe(requirements_df)
 
                 @st.cache_data
-                def convert_df_to_csv(df):
-                    return df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+                def convert_df_to_csv(_df):
+                    # Cache the conversion to prevent computation on every rerun
+                    return _df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
 
                 csv_data = convert_df_to_csv(requirements_df)
                 
@@ -185,7 +212,8 @@ def main():
                     mime="text/csv",
                 )
             else:
-                st.warning("분석은 완료되었지만 추출된 요구사항이 없습니다. 문서 내용이나 설정을 확인해주세요.")
+                # 이전에 경고 메시지가 extractor.process() 내부에서 표시되므로 추가 메시지는 생략 가능
+                pass
 
         except Exception as e:
             st.error(f"❌ 분석 중 오류가 발생했습니다: {e}")
