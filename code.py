@@ -10,7 +10,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 import io
 
-# --- 로직 클래스 1: 기존 추출기 (변경 없음) ---
+# --- 로직 클래스 1: 기존 추출기 (느슨한 추출 담당) ---
 class StreamlitDocxExtractor:
     def __init__(self, business_code: str = "MFDS"):
         self.business_code = business_code
@@ -41,15 +41,15 @@ class StreamlitDocxExtractor:
         final_requirements = []
         bfn_seq_counter = 1
         group_stack = []
-        l1_pattern = re.compile(f'^[{re.escape(level1_bullets)}]')
-        l2_pattern = re.compile(f'^[{re.escape(level2_bullets)}]')
+        l1_pattern = re.compile(f'^\s*[{re.escape(level1_bullets)}]') # 공백이 있어도 인식하도록 수정
+        l2_pattern = re.compile(f'^\s*[{re.escape(level2_bullets)}]') # 공백이 있어도 인식하도록 수정
 
         for p in paragraphs:
             line = p.text.strip()
             if not line: continue
             
-            is_level1 = bool(l1_pattern.search(line))
-            is_level2 = bool(l2_pattern.search(line))
+            is_level1 = bool(l1_pattern.search(p.text)) # strip()하지 않은 원본으로 체크
+            is_level2 = bool(l2_pattern.search(p.text))
             current_level = self._get_indentation_level(p)
             
             if not is_level1 and not is_level2: continue
@@ -57,7 +57,7 @@ class StreamlitDocxExtractor:
             while group_stack and current_level < group_stack[-1]['level']:
                 group_stack.pop()
 
-            clean_line = re.sub(f'^[{re.escape(level1_bullets + level2_bullets)}]+\s*', '', line)
+            clean_line = re.sub(f'^\s*[{re.escape(level1_bullets + level2_bullets)}]+\s*', '', p.text).strip()
             
             if is_level1:
                 while group_stack and current_level <= group_stack[-1]['level']:
@@ -95,8 +95,8 @@ class StreamlitDocxExtractor:
             block_paragraphs = all_paragraphs[start_index:end_index]
             block_text = "\n".join([p.text for p in block_paragraphs])
             
-            req_id_match = re.search(r'요구사항 고유번호\s+([A-Z]{3}-\d{3})', block_text)
-            req_name_match = re.search(r'요구사항 명칭\s+(.+?)(?:\n|$)', block_text)
+            req_id_match = re.search(r'요구사항 고유번호\s*[:]\s*([A-Z]{3}-\d{3})', block_text)
+            req_name_match = re.search(r'요구사항 명칭\s*[:]\s*(.+?)(?:\n|$)', block_text)
 
             if not req_id_match or not req_name_match: continue
             req_id, req_name = req_id_match.group(1).strip(), req_name_match.group(1).strip()
@@ -122,7 +122,7 @@ class StreamlitDocxExtractor:
         details_df = pd.DataFrame(all_requirements)
         return summary_df, details_df
 
-# --- 로직 클래스 2: 제공해주신 표준화기 (변경 없음) ---
+# --- 로직 클래스 2: 제공해주신 표준화기 (내용 생성 담당) ---
 class RFPStandardizer:
     def __init__(self):
         self.standard_format = {'header_levels': {1: '###', 2: '####', 3: '#####'}, 'requirement_prefix': 'FUR-', 'priority_mapping': {'필수': 'Essential', '권장': 'Recommended', '선택': 'Optional'}}
@@ -146,7 +146,7 @@ class RFPStandardizer:
         clean_detail = self._clean_text(detail)
         return next((info for keyword, info in d.items() if keyword in clean_detail), f"{clean_detail} 관련 입력 데이터")
     def _generate_output_info(self, detail: str) -> str:
-        d = {'프로그램관리': '프로그램 목록, 상세정보', '사용자관리': '사용자 목록, 권한 현황', '권한관리': '권한 매트릭스, 권한 변경 이력', '로그인이력': '로그인 이력 조회, 통계 리포트', 'TABLE정보': '테이블 명세서, ERD', 'SMS전송문구관리': '템플릿 목록, 발송 이력', '학사력관리': '학사력 달력, 학사일정표', '공지사항관리': '공지사항 목록, 조회 통계', '공통코드관리': '코드 목록, 코드 체계도'}
+        d = {'프로그램관리': '프로그램 목록, 상세정보', '사용자관리': '사용자 목록, 권한 현황', '권한관리': '권한 매트릭스, 권한 변경 이력', '휴일관리': '휴일 달력, 휴일 목록', '로그인이력': '로그인 이력 조회, 통계 리포트', 'TABLE정보': '테이블 명세서, ERD', 'SMS전송문구관리': '템플릿 목록, 발송 이력', '학사력관리': '학사력 달력, 학사일정표', '공지사항관리': '공지사항 목록, 조회 통계', '공통코드관리': '코드 목록, 코드 체계도'}
         clean_detail = self._clean_text(detail)
         return next((info for keyword, info in d.items() if keyword in clean_detail), f"{clean_detail} 관련 출력 데이터")
     def _generate_processing_conditions(self, detail: str) -> str:
@@ -168,7 +168,7 @@ class RFPStandardizer:
                     md.extend([f"#### {sub_req['id']} {sub_req['name']}", f"- **기능설명**: {sub_req['description']}", f"- **입력정보**: {sub_req['input_info']}", f"- **출력정보**: {sub_req['output_info']}", f"- **처리조건**: {sub_req['processing_conditions']}", f"- **산출정보**: {sub_req['deliverables']}\n"])
         return "\n".join(md)
 
-# --- 로직 클래스 3: (신규) 전체 프로세스를 지휘하는 오케스트레이터 ---
+# --- 로직 클래스 3: (신규) 전체 프로세스 지휘자 (Orchestrator) ---
 class RFPAnalysisOrchestrator:
     def __init__(self, business_code: str):
         self.extractor = StreamlitDocxExtractor(business_code)
@@ -181,17 +181,16 @@ class RFPAnalysisOrchestrator:
             return []
 
         raw_requirements = []
-        # 상위 기능 ID (예: FUN-001)로 그룹화
         grouped = details_df.groupby('요구사항 ID (RFP 원천)')
         
         for name, group in grouped:
-            # 1차 블릿에 해당하는 '요구사항 그룹'을 details로 사용
-            details_list = group['요구사항 그룹'].unique().tolist()
+            # 1차 블릿(요구사항 그룹)과 2차 블릿(세부 요구사항 내용) 모두 details로 활용
+            details_list = group['세부 요구사항 내용'].unique().tolist()
             
             req_dict = {
                 'category': '기능 요구사항' if name.startswith('FUN') else '비기능 요구사항',
                 'name': group['요구사항 명칭 (RFP 원천)'].iloc[0],
-                'priority': '필수', # 우선순위는 문서에서 직접 추출하기 어려우므로 기본값 설정
+                'priority': '필수', 
                 'details': details_list
             }
             raw_requirements.append(req_dict)
@@ -200,19 +199,14 @@ class RFPAnalysisOrchestrator:
 
     def run(self, docx_file: io.BytesIO, level1_bullets: str, level2_bullets: str) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
         """전체 분석 프로세스 실행"""
-        # 1단계: 느슨하게 데이터 추출
         summary_df, details_df = self.extractor.process(docx_file, level1_bullets, level2_bullets)
         
         if details_df.empty:
             return "오류: 문서에서 요구사항 정보를 추출하지 못했습니다. '요구사항 분류' 또는 '세부내용' 키워드와 블릿 설정을 확인해주세요.", pd.DataFrame(), pd.DataFrame()
 
-        # 2단계: 표준화를 위한 데이터 변환
         raw_reqs_for_standardizer = self._prepare_for_standardization(details_df)
-        
-        # 3단계: 표준화 및 콘텐츠 생성
         standardized_data = self.standardizer.standardize_requirements(raw_reqs_for_standardizer)
         
-        # 4단계: 최종 산출물(Markdown) 생성
         project_name = f"{self.business_code} 정보시스템 구축"
         markdown_output = self.standardizer.export_to_markdown(standardized_data, project_name)
         
@@ -234,7 +228,7 @@ def main():
         business_code = st.text_input("사업 코드", value="MFDS", help="사업을 식별하는 고유 코드입니다.")
         st.markdown("---")
         st.subheader("1단계: 원본 문서 분석 설정")
-        st.info("문서에서 기능 그룹과 세부 항목을 구분하기 위한 블릿 문자를 입력합니다. 띄어쓰기 등 변형이 있어도 어느 정도 인식합니다.")
+        st.info("문서에서 기능 그룹과 세부 항목을 구분하기 위한 블릿 문자를 입력합니다. 블릿 앞/뒤 공백은 자동으로 처리됩니다.")
         level1_bullets = st.text_input("기능 그룹 블릿(1차)", value="*◦○•", help="예: * 회원가입 기능")
         level2_bullets = st.text_input("세부 항목 블릿(2차)", value="-·▴", help="예: - 이메일로 가입")
 
@@ -242,20 +236,22 @@ def main():
 
     if uploaded_file is not None:
         try:
-            # 오케스트레이터 생성 및 실행
             orchestrator = RFPAnalysisOrchestrator(business_code=business_code)
             
             with st.spinner("요구사항 추출 및 표준 명세서 생성 중..."):
-                markdown_result, summary_df, details_df = orchestrator.run(uploaded_file, level1_bullets, level2_bullets)
+                markdown_result, summary_df, details_df = orchestrator.run(
+                    io.BytesIO(uploaded_file.getvalue()), 
+                    level1_bullets, 
+                    level2_bullets
+                )
 
             if "오류:" in markdown_result:
                 st.error(markdown_result)
             else:
                 st.success("✅ 표준 요구사항 명세서 생성을 완료했습니다!")
                 
-                # 최종 결과물(Markdown) 표시
                 st.subheader("📄 최종 산출물: 표준 요구사항 명세서")
-                st.markdown(markdown_result)
+                st.markdown(markdown_result, help="아래 내용은 식약처 표준에 따라 자동 생성된 명세서입니다.")
                 
                 st.download_button(
                     label="📥 명세서 다운로드 (.md 파일)",
@@ -266,11 +262,10 @@ def main():
 
                 st.markdown("---")
 
-                # 원본 추출 데이터는 Expander 안에 표시
                 with st.expander("원본 추출 데이터 보기 (1단계 결과)"):
                     st.subheader("📊 상위 기능 요약")
                     st.dataframe(summary_df)
-                    st.subheader("📋 전체 세부 요구사항 목록")
+                    st.subheader("📋 원본 세부 요구사항 목록")
                     st.dataframe(details_df)
 
         except Exception as e:
