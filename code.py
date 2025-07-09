@@ -11,7 +11,7 @@ from docx.text.paragraph import Paragraph
 import io
 import google.generativeai as genai
 
-# --- 1단계 로직: 텍스트 추출기 ---
+# --- 1단계 로직: 텍스트 추출기 (이전과 동일) ---
 class AdvancedDocxExtractor:
     def __init__(self, business_code: str = "MFDS"):
         self.business_code = business_code
@@ -113,13 +113,12 @@ class GeminiProcessor:
         self.api_key = api_key
         try:
             genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash-latest') # 더 빠르고 경제적인 모델로 변경
+            self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
         except Exception as e:
             st.error(f"Gemini API 키 설정 중 오류가 발생했습니다: {e}")
             self.model = None
 
     def _format_dataframe_for_llm(self, df: pd.DataFrame) -> str:
-        """DataFrame을 LLM이 이해하기 좋은 계층적 Markdown 텍스트로 변환"""
         markdown_lines = []
         for _, row in df.iterrows():
             indent = "  " * (row['레벨'] - 1)
@@ -127,23 +126,16 @@ class GeminiProcessor:
         return "\n".join(markdown_lines)
 
     def reconstruct_requirements(self, df: pd.DataFrame, custom_prompt: str) -> str:
-        """추출된 데이터를 바탕으로 제미나이를 호출하여 요구사항을 재구성"""
         if not self.model:
             return "오류: Gemini 모델이 초기화되지 않았습니다. API 키를 확인해주세요."
             
         formatted_text = self._format_dataframe_for_llm(df)
-        
-        final_prompt = f"""{custom_prompt}
-
-### 원본 추출 데이터 (계층적 목록):
-{formatted_text}
-"""
+        final_prompt = f"{custom_prompt}\n\n### 원본 추출 데이터 (계층적 목록):\n{formatted_text}"
         try:
             response = self.model.generate_content(final_prompt)
             return response.text
         except Exception as e:
             return f"Gemini API 호출 중 오류가 발생했습니다: {e}"
-
 
 # --- Streamlit UI 구성 ---
 def main():
@@ -152,7 +144,7 @@ def main():
     st.markdown("**1단계**: DOCX 문서에서 요구사항 텍스트를 계층적으로 추출합니다.\n"
                 "**2단계**: 추출된 텍스트를 Gemini AI를 사용하여 명확한 요구사항 명세로 재구성합니다.")
 
-    # 세션 상태 초기화 (추출된 데이터와 재구성된 결과를 저장하기 위함)
+    # 세션 상태 초기화
     if 'extracted_df' not in st.session_state:
         st.session_state.extracted_df = pd.DataFrame()
     if 'reconstructed_text' not in st.session_state:
@@ -166,7 +158,7 @@ def main():
         st.header("⚙️ 2단계: AI 재구성 설정")
         api_key = st.text_input("Gemini API 키를 입력하세요.", type="password", help="[Google AI Studio](https://aistudio.google.com/app/apikey)에서 API 키를 발급받을 수 있습니다.")
 
-
+    # --- UI 레이아웃 설정 ---
     col1, col2 = st.columns(2)
 
     with col1:
@@ -174,21 +166,31 @@ def main():
         uploaded_file = st.file_uploader("분석할 .docx 파일을 업로드하세요.", type=["docx"])
 
         if uploaded_file:
-            # 파일이 업로드되면 항상 새로 추출
             extractor = AdvancedDocxExtractor(business_code=business_code)
             with st.spinner("1단계: 문서 구조 분석 및 텍스트 추출 중..."):
                 file_bytes = io.BytesIO(uploaded_file.getvalue())
                 st.session_state.extracted_df = extractor.process(file_bytes)
-                st.session_state.reconstructed_text = "" # 새 파일 업로드 시 재구성 결과 초기화
+                st.session_state.reconstructed_text = ""
 
         if not st.session_state.extracted_df.empty:
             st.success(f"✅ 총 {len(st.session_state.extracted_df)}개의 요구사항 항목을 성공적으로 추출했습니다.")
-            st.dataframe(st.session_state.extracted_df)
+            
+            # [기능 추가] 핵심 기능 목록 추출 및 미리보기
+            st.subheader("📋 핵심 기능 목록 (미리보기)")
+            feature_list_df = st.session_state.extracted_df[st.session_state.extracted_df['레벨'] <= 2]
+            st.dataframe(feature_list_df.head(5)) # 상위 5개만 표시
+
+            with st.expander("전체 기능 목록 보기"):
+                st.dataframe(feature_list_df)
+
+            # 전체 상세 목록은 Expander 안에 넣어서 UI를 깔끔하게 유지
+            with st.expander("전체 상세 추출 목록 보기"):
+                st.dataframe(st.session_state.extracted_df)
         
             st.download_button(
-                label="📥 추출 결과를 CSV 파일로 다운로드",
+                label="📥 전체 추출 결과를 CSV로 다운로드",
                 data=st.session_state.extracted_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
-                file_name=f"extracted_requirements_{business_code}.csv",
+                file_name=f"extracted_requirements_full_{business_code}.csv",
                 mime="text/csv",
             )
     
@@ -205,8 +207,7 @@ def main():
                 3.  **전문 용어 사용**: 적절한 경우, '기능 요구사항', '성능 요구사항', '보안 요구사항' 등 전문 용어를 사용하여 요구사항을 분류하세요.
                 4.  **출력 형식**: 최종 결과물은 전문가가 작성한 기술 문서처럼 보이는 깔끔한 Markdown 형식으로 정리해주세요. (제목, 글머리 기호, 굵은 글씨 등을 적극적으로 활용)
                 """
-                
-                user_prompt = st.text_area("LLM에게 내릴 지시사항 (프롬프트)", value=default_prompt, height=350)
+                user_prompt = st.text_area("LLM에게 내릴 지시사항 (프롬프트)", value=default_prompt, height=280)
 
                 if st.button("요구사항 재구성 실행 ✨", type="primary"):
                     processor = GeminiProcessor(api_key=api_key)
@@ -214,7 +215,15 @@ def main():
                         st.session_state.reconstructed_text = processor.reconstruct_requirements(st.session_state.extracted_df, user_prompt)
                 
                 if st.session_state.reconstructed_text:
-                    st.markdown(st.session_state.reconstructed_text)
+                    # [기능 추가] 재구성 결과 미리보기
+                    st.subheader("🤖 재구성 결과 (미리보기)")
+                    preview_lines = st.session_state.reconstructed_text.split('\n')[:15] # 상위 15줄만 표시
+                    st.markdown("\n".join(preview_lines))
+                    st.markdown("...") # 더 있음을 암시
+
+                    with st.expander("전체 재구성 결과 보기"):
+                        st.markdown(st.session_state.reconstructed_text)
+
                     st.download_button(
                         label="📥 재구성 결과를 Markdown 파일로 다운로드",
                         data=st.session_state.reconstructed_text.encode('utf-8-sig'),
@@ -222,7 +231,7 @@ def main():
                         mime="text/markdown",
                     )
             else:
-                st.warning("Gemini AI를 사용하려면 사이드바에 API 키를 입력해주세요.")
+                st.warning("AI 재구성 기능을 사용하려면 사이드바에 Gemini API 키를 입력해주세요.")
         else:
             st.info("먼저 DOCX 파일을 업로드하여 요구사항을 추출해주세요.")
 
