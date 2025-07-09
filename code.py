@@ -11,7 +11,7 @@ from docx.text.paragraph import Paragraph
 import io
 import google.generativeai as genai
 
-# --- 1단계 로직: 텍스트 추출기 (이전과 동일) ---
+# --- 1단계 로직: 텍스트 추출기 ---
 class AdvancedDocxExtractor:
     def __init__(self, business_code: str = "MFDS"):
         self.business_code = business_code
@@ -111,25 +111,31 @@ class AdvancedDocxExtractor:
 class GeminiProcessor:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        try:
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash-latest') # 더 빠르고 경제적인 모델로 변경
+        except Exception as e:
+            st.error(f"Gemini API 키 설정 중 오류가 발생했습니다: {e}")
+            self.model = None
 
     def _format_dataframe_for_llm(self, df: pd.DataFrame) -> str:
         """DataFrame을 LLM이 이해하기 좋은 계층적 Markdown 텍스트로 변환"""
         markdown_lines = []
         for _, row in df.iterrows():
-            # 레벨에 따라 들여쓰기 적용
             indent = "  " * (row['레벨'] - 1)
             markdown_lines.append(f"{indent}- {row['내용']}")
         return "\n".join(markdown_lines)
 
     def reconstruct_requirements(self, df: pd.DataFrame, custom_prompt: str) -> str:
         """추출된 데이터를 바탕으로 제미나이를 호출하여 요구사항을 재구성"""
+        if not self.model:
+            return "오류: Gemini 모델이 초기화되지 않았습니다. API 키를 확인해주세요."
+            
         formatted_text = self._format_dataframe_for_llm(df)
         
         final_prompt = f"""{custom_prompt}
 
-### 원본 추출 데이터:
+### 원본 추출 데이터 (계층적 목록):
 {formatted_text}
 """
         try:
@@ -146,61 +152,79 @@ def main():
     st.markdown("**1단계**: DOCX 문서에서 요구사항 텍스트를 계층적으로 추출합니다.\n"
                 "**2단계**: 추출된 텍스트를 Gemini AI를 사용하여 명확한 요구사항 명세로 재구성합니다.")
 
-    # 세션 상태 초기화
+    # 세션 상태 초기화 (추출된 데이터와 재구성된 결과를 저장하기 위함)
     if 'extracted_df' not in st.session_state:
         st.session_state.extracted_df = pd.DataFrame()
+    if 'reconstructed_text' not in st.session_state:
+        st.session_state.reconstructed_text = ""
 
     with st.sidebar:
         st.header("⚙️ 1단계: 추출 설정")
         business_code = st.text_input("사업 코드 (ID 생성용)", value="MFDS")
-
-    uploaded_file = st.file_uploader("분석할 .docx 파일을 업로드하세요.", type=["docx"])
-
-    if uploaded_file:
-        extractor = AdvancedDocxExtractor(business_code=business_code)
-        with st.spinner("1단계: 문서 구조 분석 및 텍스트 추출 중..."):
-            file_bytes = io.BytesIO(uploaded_file.getvalue())
-            st.session_state.extracted_df = extractor.process(file_bytes)
-
-    if not st.session_state.extracted_df.empty:
-        st.header("1️⃣ 추출 결과")
-        st.success(f"✅ 총 {len(st.session_state.extracted_df)}개의 요구사항 항목을 성공적으로 추출했습니다.")
-        st.dataframe(st.session_state.extracted_df)
-        
-        st.download_button(
-            label="📥 추출 결과를 CSV 파일로 다운로드",
-            data=st.session_state.extracted_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
-            file_name=f"extracted_requirements_{business_code}.csv",
-            mime="text/csv",
-        )
-
+        st.info("이 도구는 블릿 문자 설정 없이, 문서의 구조 자체를 분석하여 자동으로 계층을 인식합니다.")
         st.markdown("---")
-        
-        # --- Gemini 연동 UI ---
-        st.header("2️⃣ Gemini AI로 요구사항 재구성")
-        
+        st.header("⚙️ 2단계: AI 재구성 설정")
         api_key = st.text_input("Gemini API 키를 입력하세요.", type="password", help="[Google AI Studio](https://aistudio.google.com/app/apikey)에서 API 키를 발급받을 수 있습니다.")
+
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.header("1️⃣ 원본 문서 및 추출")
+        uploaded_file = st.file_uploader("분석할 .docx 파일을 업로드하세요.", type=["docx"])
+
+        if uploaded_file:
+            # 파일이 업로드되면 항상 새로 추출
+            extractor = AdvancedDocxExtractor(business_code=business_code)
+            with st.spinner("1단계: 문서 구조 분석 및 텍스트 추출 중..."):
+                file_bytes = io.BytesIO(uploaded_file.getvalue())
+                st.session_state.extracted_df = extractor.process(file_bytes)
+                st.session_state.reconstructed_text = "" # 새 파일 업로드 시 재구성 결과 초기화
+
+        if not st.session_state.extracted_df.empty:
+            st.success(f"✅ 총 {len(st.session_state.extracted_df)}개의 요구사항 항목을 성공적으로 추출했습니다.")
+            st.dataframe(st.session_state.extracted_df)
         
-        if api_key:
-            default_prompt = """당신은 IT 프로젝트 요구사항 분석 전문가입니다. 아래에 제공된 '원본 추출 데이터'는 문서에서 기계적으로 추출되어 다소 정제되지 않은 텍스트 목록입니다.
+            st.download_button(
+                label="📥 추출 결과를 CSV 파일로 다운로드",
+                data=st.session_state.extracted_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
+                file_name=f"extracted_requirements_{business_code}.csv",
+                mime="text/csv",
+            )
+    
+    with col2:
+        st.header("2️⃣ AI 재구성 결과")
+        if not st.session_state.extracted_df.empty:
+            if api_key:
+                default_prompt = """당신은 IT 프로젝트 요구사항 분석 전문가입니다. 아래에 제공된 '원본 추출 데이터'는 RFP 문서에서 기계적으로 추출된 계층적 텍스트 목록입니다.
 
-            당신의 임무는 다음 지침에 따라 이 데이터를 전문가 수준의 '요구사항 명세'로 재구성하는 것입니다.
+                당신의 임무는 다음 지침에 따라 이 데이터를 전문가 수준의 '요구사항 명세서'로 재구성하는 것입니다.
 
-            1.  **그룹화 및 구조화**: 연관된 항목들을 논리적인 그룹으로 묶고, 명확한 제목과 부제목을 사용하세요.
-            2.  **명료한 문장**: 각 요구사항은 명확하고 간결한 문장으로 다시 작성하세요. (예: "~해야 한다", "~할 수 있어야 한다.")
-            3.  **전문 용어 사용**: 적절한 경우, '기능 요구사항', '비기능 요구사항', '데이터 요구사항' 등 전문 용어를 사용하여 분류하세요.
-            4.  **출력 형식**: 최종 결과물은 전문가가 작성한 것처럼 보이는 깔끔한 Markdown 형식으로 정리해주세요. (예: 제목, 목록, 테이블 등 활용)
-            """
-            
-            user_prompt = st.text_area("LLM에게 내릴 지시사항 (프롬프트)", value=default_prompt, height=300)
-
-            if st.button("요구사항 재구성 실행 ✨", type="primary"):
-                processor = GeminiProcessor(api_key=api_key)
-                with st.spinner("Gemini AI가 요구사항을 재구성하고 있습니다..."):
-                    reconstructed_text = processor.reconstruct_requirements(st.session_state.extracted_df, user_prompt)
+                1.  **그룹화 및 구조화**: 연관된 항목들을 논리적인 기능 그룹으로 묶고, 명확한 제목과 부제목(예: `### 1. 사용자 관리`)을 사용하세요.
+                2.  **명료한 문장**: 각 요구사항은 명확하고 완전한 문장으로 다시 작성하세요. (예: "~해야 한다", "~ 기능을 제공해야 한다.")
+                3.  **전문 용어 사용**: 적절한 경우, '기능 요구사항', '성능 요구사항', '보안 요구사항' 등 전문 용어를 사용하여 요구사항을 분류하세요.
+                4.  **출력 형식**: 최종 결과물은 전문가가 작성한 기술 문서처럼 보이는 깔끔한 Markdown 형식으로 정리해주세요. (제목, 글머리 기호, 굵은 글씨 등을 적극적으로 활용)
+                """
                 
-                st.subheader("🤖 Gemini 재구성 결과")
-                st.markdown(reconstructed_text)
+                user_prompt = st.text_area("LLM에게 내릴 지시사항 (프롬프트)", value=default_prompt, height=350)
+
+                if st.button("요구사항 재구성 실행 ✨", type="primary"):
+                    processor = GeminiProcessor(api_key=api_key)
+                    with st.spinner("Gemini AI가 요구사항을 재구성하고 있습니다... (최대 1분 소요)"):
+                        st.session_state.reconstructed_text = processor.reconstruct_requirements(st.session_state.extracted_df, user_prompt)
+                
+                if st.session_state.reconstructed_text:
+                    st.markdown(st.session_state.reconstructed_text)
+                    st.download_button(
+                        label="📥 재구성 결과를 Markdown 파일로 다운로드",
+                        data=st.session_state.reconstructed_text.encode('utf-8-sig'),
+                        file_name=f"reconstructed_requirements_{business_code}.md",
+                        mime="text/markdown",
+                    )
+            else:
+                st.warning("Gemini AI를 사용하려면 사이드바에 API 키를 입력해주세요.")
+        else:
+            st.info("먼저 DOCX 파일을 업로드하여 요구사항을 추출해주세요.")
 
 if __name__ == '__main__':
     main()
