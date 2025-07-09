@@ -10,7 +10,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 import io
 
-# --- 로직 클래스 1: 기존 추출기 (느슨한 추출 담당) ---
+# --- 로직 클래스 1: 추출기 (견고성 강화) ---
 class StreamlitDocxExtractor:
     def __init__(self, business_code: str = "MFDS"):
         self.business_code = business_code
@@ -41,15 +41,17 @@ class StreamlitDocxExtractor:
         final_requirements = []
         bfn_seq_counter = 1
         group_stack = []
-        l1_pattern = re.compile(f'^\s*[{re.escape(level1_bullets)}]') # 공백이 있어도 인식하도록 수정
-        l2_pattern = re.compile(f'^\s*[{re.escape(level2_bullets)}]') # 공백이 있어도 인식하도록 수정
+        # [수정] SyntaxWarning 해결 및 공백 허용을 위해 Raw String(r'')과 \s* 사용
+        l1_pattern = re.compile(rf'^\s*[{re.escape(level1_bullets)}]')
+        l2_pattern = re.compile(rf'^\s*[{re.escape(level2_bullets)}]')
 
         for p in paragraphs:
-            line = p.text.strip()
-            if not line: continue
+            # strip() 하지 않은 원본 텍스트로 블릿 여부 먼저 확인
+            raw_text = p.text
+            if not raw_text.strip(): continue
             
-            is_level1 = bool(l1_pattern.search(p.text)) # strip()하지 않은 원본으로 체크
-            is_level2 = bool(l2_pattern.search(p.text))
+            is_level1 = bool(l1_pattern.search(raw_text))
+            is_level2 = bool(l2_pattern.search(raw_text))
             current_level = self._get_indentation_level(p)
             
             if not is_level1 and not is_level2: continue
@@ -57,19 +59,22 @@ class StreamlitDocxExtractor:
             while group_stack and current_level < group_stack[-1]['level']:
                 group_stack.pop()
 
-            clean_line = re.sub(f'^\s*[{re.escape(level1_bullets + level2_bullets)}]+\s*', '', p.text).strip()
-            
+            # [수정] 블릿과 앞뒤 공백을 제거한 순수 내용 추출
+            clean_line = re.sub(rf'^\s*[{re.escape(level1_bullets + level2_bullets)}]+\s*', '', raw_text).strip()
+            if not clean_line: continue
+
             if is_level1:
                 while group_stack and current_level <= group_stack[-1]['level']:
                     group_stack.pop()
                 group_stack.append({'title': clean_line, 'level': current_level})
-            
             elif is_level2 and group_stack:
-                 group_stack.append({'title': clean_line, 'level': current_level})
+                # 2차 블릿은 스택에 추가하지 않고 바로 사용
+                pass
 
             if group_stack:
                 group_name = group_stack[0]['title']
                 detail_content = clean_line
+                
                 is_duplicate = any(req['요구사항 그룹'] == group_name and req['세부 요구사항 내용'] == detail_content for req in final_requirements)
                 if not is_duplicate:
                     final_requirements.append({
@@ -84,9 +89,7 @@ class StreamlitDocxExtractor:
         all_paragraphs = self._get_all_paragraphs_in_order(doc)
         
         block_markers = [i for i, p in enumerate(all_paragraphs) if '요구사항 분류' in p.text]
-        
-        if not block_markers:
-            return pd.DataFrame(), pd.DataFrame()
+        if not block_markers: return pd.DataFrame(), pd.DataFrame()
 
         all_requirements = []
         high_level_reqs = [] 
@@ -95,8 +98,9 @@ class StreamlitDocxExtractor:
             block_paragraphs = all_paragraphs[start_index:end_index]
             block_text = "\n".join([p.text for p in block_paragraphs])
             
-            req_id_match = re.search(r'요구사항 고유번호\s*[:]\s*([A-Z]{3}-\d{3})', block_text)
-            req_name_match = re.search(r'요구사항 명칭\s*[:]\s*(.+?)(?:\n|$)', block_text)
+            # [개선] 콜론(:) 유무, 공백 등 다양한 포맷에 대응하도록 정규식 강화
+            req_id_match = re.search(r'요구사항\s*고유번호\s*[:]?\s*([A-Z]{3}-\d{3})', block_text)
+            req_name_match = re.search(r'요구사항\s*명칭\s*[:]?\s*(.+?)(?:\n|$)', block_text)
 
             if not req_id_match or not req_name_match: continue
             req_id, req_name = req_id_match.group(1).strip(), req_name_match.group(1).strip()
@@ -113,10 +117,13 @@ class StreamlitDocxExtractor:
                 all_requirements.extend(parsed_reqs)
                 
                 if parsed_reqs:
+                    # '요구사항 그룹'의 고유한 개수를 세어 요약 정보 생성
+                    unique_groups = pd.Series([r['요구사항 그룹'] for r in parsed_reqs]).nunique()
                     high_level_reqs.append({
                         '요구사항 ID': req_id, '요구사항 명칭': req_name,
                         '유형': '기능' if req_id.startswith('FUN') else '비기능',
-                        '세부 요구사항 개수': len(parsed_reqs)
+                        '기능 그룹 수': unique_groups,
+                        '총 세부 항목 수': len(parsed_reqs)
                     })
         summary_df = pd.DataFrame(high_level_reqs)
         details_df = pd.DataFrame(all_requirements)
@@ -168,7 +175,7 @@ class RFPStandardizer:
                     md.extend([f"#### {sub_req['id']} {sub_req['name']}", f"- **기능설명**: {sub_req['description']}", f"- **입력정보**: {sub_req['input_info']}", f"- **출력정보**: {sub_req['output_info']}", f"- **처리조건**: {sub_req['processing_conditions']}", f"- **산출정보**: {sub_req['deliverables']}\n"])
         return "\n".join(md)
 
-# --- 로직 클래스 3: (신규) 전체 프로세스 지휘자 (Orchestrator) ---
+# --- 로직 클래스 3: 전체 프로세스 지휘자 (Orchestrator) ---
 class RFPAnalysisOrchestrator:
     def __init__(self, business_code: str):
         self.extractor = StreamlitDocxExtractor(business_code)
@@ -176,40 +183,28 @@ class RFPAnalysisOrchestrator:
         self.business_code = business_code
 
     def _prepare_for_standardization(self, details_df: pd.DataFrame) -> List[Dict]:
-        """추출된 DataFrame을 Standardizer 입력 형식으로 변환"""
-        if details_df.empty:
-            return []
-
+        if details_df.empty: return []
         raw_requirements = []
         grouped = details_df.groupby('요구사항 ID (RFP 원천)')
         
         for name, group in grouped:
-            # 1차 블릿(요구사항 그룹)과 2차 블릿(세부 요구사항 내용) 모두 details로 활용
+            # 1차, 2차 블릿 내용을 모두 Standardizer에 전달
             details_list = group['세부 요구사항 내용'].unique().tolist()
-            
             req_dict = {
                 'category': '기능 요구사항' if name.startswith('FUN') else '비기능 요구사항',
                 'name': group['요구사항 명칭 (RFP 원천)'].iloc[0],
-                'priority': '필수', 
-                'details': details_list
-            }
+                'priority': '필수', 'details': details_list }
             raw_requirements.append(req_dict)
-            
         return raw_requirements
 
     def run(self, docx_file: io.BytesIO, level1_bullets: str, level2_bullets: str) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
-        """전체 분석 프로세스 실행"""
         summary_df, details_df = self.extractor.process(docx_file, level1_bullets, level2_bullets)
-        
         if details_df.empty:
             return "오류: 문서에서 요구사항 정보를 추출하지 못했습니다. '요구사항 분류' 또는 '세부내용' 키워드와 블릿 설정을 확인해주세요.", pd.DataFrame(), pd.DataFrame()
-
-        raw_reqs_for_standardizer = self._prepare_for_standardization(details_df)
-        standardized_data = self.standardizer.standardize_requirements(raw_reqs_for_standardizer)
-        
+        raw_reqs = self._prepare_for_standardization(details_df)
+        standardized_data = self.standardizer.standardize_requirements(raw_reqs)
         project_name = f"{self.business_code} 정보시스템 구축"
         markdown_output = self.standardizer.export_to_markdown(standardized_data, project_name)
-        
         return markdown_output, summary_df, details_df
 
 # --- Streamlit UI 구성 ---
@@ -228,7 +223,7 @@ def main():
         business_code = st.text_input("사업 코드", value="MFDS", help="사업을 식별하는 고유 코드입니다.")
         st.markdown("---")
         st.subheader("1단계: 원본 문서 분석 설정")
-        st.info("문서에서 기능 그룹과 세부 항목을 구분하기 위한 블릿 문자를 입력합니다. 블릿 앞/뒤 공백은 자동으로 처리됩니다.")
+        st.info("문서에 사용된 대표 블릿 문자를 입력하세요. 블릿 앞/뒤 공백이나 약간의 변형은 자동으로 처리됩니다.")
         level1_bullets = st.text_input("기능 그룹 블릿(1차)", value="*◦○•", help="예: * 회원가입 기능")
         level2_bullets = st.text_input("세부 항목 블릿(2차)", value="-·▴", help="예: - 이메일로 가입")
 
@@ -239,10 +234,10 @@ def main():
             orchestrator = RFPAnalysisOrchestrator(business_code=business_code)
             
             with st.spinner("요구사항 추출 및 표준 명세서 생성 중..."):
+                # 업로드된 파일을 BytesIO로 변환하여 전달
+                file_bytes = io.BytesIO(uploaded_file.getvalue())
                 markdown_result, summary_df, details_df = orchestrator.run(
-                    io.BytesIO(uploaded_file.getvalue()), 
-                    level1_bullets, 
-                    level2_bullets
+                    file_bytes, level1_bullets, level2_bullets
                 )
 
             if "오류:" in markdown_result:
